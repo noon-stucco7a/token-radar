@@ -129,6 +129,9 @@ tbody tr[data-selected="true"] { background: rgba(74, 222, 128, 0.08); }
 .mult-table { font-size: 13px; }
 .mult-table th, .mult-table td { padding: var(--step-2) var(--step-3); }
 .mult-wrap { max-height: 320px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius-control); }
+.method .rules { margin: 0; padding-left: var(--step-5); display: grid; gap: var(--step-2); color: var(--muted); max-width: 78ch; }
+.method .rules b { color: var(--ink); font-weight: 600; }
+.chips { display: flex; flex-wrap: wrap; gap: var(--step-2); }
 .empty { padding: var(--step-7) var(--step-5); text-align: center; display: grid; gap: var(--step-3); justify-items: center; }
 .empty p { color: var(--muted); }
 .button { min-height: 36px; padding: 0 var(--step-4); border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--raised); color: var(--ink); }
