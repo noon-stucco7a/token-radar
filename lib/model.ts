@@ -1,4 +1,4 @@
-// The token radar's model, version radar-2: one snapshot of the protocol universe in, one ranked
+// The token radar's model, version radar-3: one snapshot of the protocol universe in, one ranked
 // board out. Every figure comes from the snapshot itself; no protocol name is ever special-cased.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds the
@@ -7,13 +7,16 @@
 // whose token already trades are never ranked: they are the model's measuring stick, and the dashboard
 // sets them aside in a Live view with the market's own values.
 //
-// Implied value is a comparables estimate, built in four stated steps:
+// Implied value is a comparables estimate, built in five stated steps:
 //
 //   1. Peer multiple. Among live-token protocols, market cap / TVL is the price the market pays for a
 //      dollar of a protocol's TVL. Each category's multiple is the median of that ratio over the
 //      category's live protocols, shrunk toward the all-protocol median so a category with two peers
 //      cannot outvote one with forty:  multiple = (n x category median + K x global median) / (n + K),
-//      clamped to [0.03, 1.25]. A category with no live peer uses the global median.
+//      clamped to [0.03, 1.25]. A category with no live peer uses the global median. Radar-3 shrinks
+//      thin categories harder: below three live peers the phantom weight grows by 9 for every missing
+//      peer (K = 24 for a single peer, 15 for two), because a median of one or two ratios is mostly
+//      noise; at three peers and above the weight is the plain K = 6, exactly as radar-2 had it.
 //   2. Base value = tvl_usd x peer multiple: what this protocol's TVL would be worth if the market
 //      priced it like its live peers.
 //   3. Growth and maturity. Seven-day TVL growth moves the base by (clamped change / 100) x 0.35.
@@ -21,6 +24,12 @@
 //      factor rises from 0.75 to 1.00 over three years; an unknown listing date scores a flat 0.85.
 //   4. Pre-token discount x 0.85: a token that does not trade yet carries launch and liquidity risk
 //      its live peers have already shed, so the estimate prices it below them on purpose.
+//   5. Diversity quota. No category may hold more than 5 of the board's top 20 places: a board whose
+//      head is one category repeated is a worse map of where launches will come from, whatever the
+//      raw values say. The model enforces the cap itself, before any row is written: while a category
+//      holds more than 5 of the top 20, that category's multiple steps down by x0.9 and the board is
+//      repriced, until the cap holds (a category priced on the global median steps down from it).
+//      The multiples table shows the final multiple and how many steps each category took.
 //
 //   implied = max(1, round(tvl x multiple x growthMult x maturityMult x 0.85))
 //
@@ -53,6 +62,8 @@ export interface Snapshot {
 /** The model's constants, as the dashboard states them. */
 export interface ModelConstants {
   shrinkage_k: number;
+  small_sample_n: number;
+  small_sample_boost: number;
   multiple_min: number;
   multiple_max: number;
   growth_weight: number;
@@ -63,10 +74,15 @@ export interface ModelConstants {
   maturity_days: number;
   unknown_age_multiplier: number;
   pretoken_discount: number;
+  quota_top: number;
+  quota_max: number;
+  quota_step: number;
 }
 
 export const MODEL: ModelConstants = {
   shrinkage_k: 6,
+  small_sample_n: 3,
+  small_sample_boost: 9,
   multiple_min: 0.03,
   multiple_max: 1.25,
   growth_weight: 0.35,
@@ -77,10 +93,13 @@ export const MODEL: ModelConstants = {
   maturity_days: 1095,
   unknown_age_multiplier: 0.85,
   pretoken_discount: 0.85,
+  quota_top: 20,
+  quota_max: 5,
+  quota_step: 0.9,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by implied value. */
 export const EARLY_ROWS = 180;
@@ -94,6 +113,8 @@ export interface CategoryMultiple {
   peers: number;
   median: number | null;
   used: number;
+  /** Diversity-quota step-downs applied to `used` after shrinkage (step 5 of the model). */
+  quota_steps: number;
 }
 
 /** A farm step: the action, what it costs, and how long it takes. */
@@ -109,6 +130,7 @@ export interface ModelBreakdown {
   peer_count: number;
   category_median: number | null;
   global_median: number;
+  quota_steps: number;
   growth_pct: number;
   growth_multiplier: number;
   maturity_multiplier: number;
@@ -137,7 +159,13 @@ export interface BoardRow {
   farm_steps: string[];
 }
 
-/** The dashboard's view of one row: the board row's figures, its reason and its farm plan. */
+/**
+ * The dashboard's view of one row: the board row's figures, its reason and its farm plan. Leaner
+ * than the board row on purpose: a pre-token row's market cap is always null and its listing date
+ * is carried as age alone, and what the page can re-derive exactly is not repeated (the growth
+ * multiplier from change_7d and the model constants; the category's median and peer count from
+ * the multiples table the same payload carries).
+ */
 export interface RadarRow {
   rank: number;
   slug: string;
@@ -146,15 +174,10 @@ export interface RadarRow {
   chains: string[];
   tvl_usd: number;
   change_7d: number | null;
-  mcap_usd: number | null;
-  listed_at: string | null;
   age_days: number | null;
   watchlist: boolean;
   implied_value_usd: number;
   peer_multiple: number;
-  peer_count: number;
-  category_median: number | null;
-  growth_multiplier: number;
   maturity_multiplier: number;
   reason: string;
   farm_steps: string[];
@@ -224,6 +247,15 @@ function median(values: number[]): number {
 }
 
 /**
+ * The phantom weight a category's median is shrunk with: the plain shrinkage_k once the category
+ * has small_sample_n live peers, growing by small_sample_boost for every peer below that, so a
+ * median of one or two ratios is treated as the weak evidence it is.
+ */
+export function shrinkageWeight(peers: number, model: ModelConstants = MODEL): number {
+  return model.shrinkage_k + model.small_sample_boost * Math.max(0, model.small_sample_n - peers);
+}
+
+/**
  * The peer evidence: for every category, the live-token protocols' market-cap/TVL ratios, their
  * median, and the shrunk multiple the model uses. Live means the record carries a market cap.
  */
@@ -243,8 +275,9 @@ export function peerMultiples(snapshot: Snapshot, model: ModelConstants = MODEL)
   const byCategory = new Map<string, CategoryMultiple>();
   for (const [category, list] of ratios) {
     const med = median(list);
-    const used = Math.min(model.multiple_max, Math.max(model.multiple_min, (list.length * med + model.shrinkage_k * globalMedian) / (list.length + model.shrinkage_k)));
-    byCategory.set(category, { category, peers: list.length, median: round4(med), used: round4(used) });
+    const k = shrinkageWeight(list.length, model);
+    const used = Math.min(model.multiple_max, Math.max(model.multiple_min, (list.length * med + k * globalMedian) / (list.length + k)));
+    byCategory.set(category, { category, peers: list.length, median: round4(med), used: round4(used), quota_steps: 0 });
   }
   return { globalMedian: round4(globalMedian), byCategory };
 }
@@ -253,7 +286,7 @@ export function peerMultiples(snapshot: Snapshot, model: ModelConstants = MODEL)
 function multipleFor(p: SnapshotProtocol, peers: { globalMedian: number; byCategory: Map<string, CategoryMultiple> }): CategoryMultiple {
   const found = peers.byCategory.get(p.category ?? 'Uncategorised');
   if (found !== undefined) return found;
-  return { category: p.category ?? 'Uncategorised', peers: 0, median: null, used: peers.globalMedian };
+  return { category: p.category ?? 'Uncategorised', peers: 0, median: null, used: peers.globalMedian, quota_steps: 0 };
 }
 
 /** The multipliers and the implied value one protocol gets under `model`. */
@@ -283,6 +316,7 @@ export function impliedValue(
       peer_count: multiple.peers,
       category_median: multiple.median,
       global_median: peers.globalMedian,
+      quota_steps: multiple.quota_steps,
       growth_pct: growthPct,
       growth_multiplier: growthMult,
       maturity_multiplier: maturityMult,
@@ -328,25 +362,68 @@ export function reasonFor(p: SnapshotProtocol, b: ModelBreakdown, age: number | 
   const cat = p.category ?? 'Uncategorised';
   const peerText =
     b.peer_count > 0
-      ? `${b.peer_count} live ${cat} peer${b.peer_count === 1 ? '' : 's'} trading at a median ${b.category_median}x TVL; shrunk toward the ${b.global_median}x all-protocol median, the model prices ${p.name} at ${b.peer_multiple}x`
-      : `no live ${cat} peer trades yet, so the model prices ${p.name} at the ${b.global_median}x all-protocol median`;
+      ? `${b.peer_count} live ${cat} peer${b.peer_count === 1 ? '' : 's'} at a median ${b.category_median}x TVL, shrunk toward the ${b.global_median}x all-protocol median, price ${p.name} at ${b.peer_multiple}x`
+      : `no live ${cat} peer trades yet, so ${p.name} is priced at the ${b.global_median}x all-protocol median`;
+  const quotaText = b.quota_steps > 0 ? ` after ${b.quota_steps} diversity step-down${b.quota_steps === 1 ? '' : 's'} for the top-20 category quota` : '';
   const growthText =
     p.change_7d === null
       ? 'no seven-day change is recorded, so growth is neutral'
       : `seven-day TVL change of ${p.change_7d > 0 ? '+' : ''}${round2(p.change_7d)}% moves the estimate by x${b.growth_multiplier}`;
   const ageText =
     age === null
-      ? 'its first listing date is not recorded, so maturity is a flat x0.85'
-      : `${age} days live with no token gives a maturity factor of x${b.maturity_multiplier}`;
-  const coverText = watchlist ? 'On the watchlist (TVL at or above the floor, no token on record). ' : 'An early-radar row below the watchlist floor. ';
-  return `${coverText}${peerText}: ${usdShort(p.tvl_usd)} of TVL at that multiple, ${growthText}, ${ageText}, and a x${b.pretoken_discount} pre-token discount give an implied ${usdShort(implied)}.`;
+      ? 'no listing date is recorded, so maturity is a flat x0.85'
+      : `${age} days live with no token: maturity x${b.maturity_multiplier}`;
+  const coverText = watchlist ? 'On the watchlist (TVL at or above the floor, no token). ' : 'Below the watchlist floor (early radar). ';
+  return `${coverText}${peerText}${quotaText}: ${usdShort(p.tvl_usd)} of TVL at that multiple, ${growthText}, ${ageText}, and a x${b.pretoken_discount} pre-token discount give an implied ${usdShort(implied)}.`;
 }
 
-/** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
+/** The category holding too many of the board's first `top` places, or null: most places first, name order breaks ties. */
+function quotaOffender(board: BoardRow[], model: ModelConstants): string | null {
+  const counts = new Map<string, number>();
+  for (const r of board.slice(0, model.quota_top)) {
+    const key = r.category ?? 'Uncategorised';
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  let worst: string | null = null;
+  let worstCount = model.quota_max;
+  for (const key of [...counts.keys()].sort()) {
+    if (counts.get(key)! > worstCount) {
+      worst = key;
+      worstCount = counts.get(key)!;
+    }
+  }
+  return worst;
+}
+
+/**
+ * The peer multiples the board is priced with: the shrunk medians of peerMultiples, then the
+ * diversity quota of step 5. While one category would hold more than quota_max of the top
+ * quota_top places, that category's multiple steps down by quota_step and the board is repriced;
+ * a category with no live peer, priced on the global median, steps down from the median itself.
+ * The loop is bounded and every step is a fixed multiple of the last, so the result is a pure
+ * function of the snapshot. On the sealed snapshot the step-down engages for one category only.
+ */
+export function boardPeers(snapshot: Snapshot, model: ModelConstants = MODEL): { globalMedian: number; byCategory: Map<string, CategoryMultiple> } {
+  const peers = peerMultiples(snapshot, model);
+  for (let iter = 0; iter < 200; iter++) {
+    const offender = quotaOffender(scoreBoard(snapshot, peers, model), model);
+    if (offender === null) return peers;
+    let cm = peers.byCategory.get(offender);
+    if (cm === undefined) {
+      cm = { category: offender, peers: 0, median: null, used: peers.globalMedian, quota_steps: 0 };
+      peers.byCategory.set(offender, cm);
+    }
+    if (cm.used <= model.multiple_min) return peers;
+    cm.used = round4(Math.max(model.multiple_min, cm.used * model.quota_step));
+    cm.quota_steps += 1;
+  }
+  return peers;
+}
+
+/** The protocols the board ranks, strongest first, with ranks 1..n, priced with `peers`. */
+export function scoreBoard(snapshot: Snapshot, peers: { globalMedian: number; byCategory: Map<string, CategoryMultiple> }, model: ModelConstants = MODEL): BoardRow[] {
   const index = bySlug(snapshot.protocols);
   const watch = new Set(snapshot.watchlist);
-  const peers = peerMultiples(snapshot, model);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but
   // the board's coverage is the gate's row and is never gambled on a missing record).
@@ -388,6 +465,11 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     reason: reasonFor(s.p, s.breakdown, s.age, s.implied, watch.has(s.p.slug)),
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
+}
+
+/** The board, priced with the board's own multiples: shrinkage first, the diversity quota applied. */
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
+  return scoreBoard(snapshot, boardPeers(snapshot, model), model);
 }
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
@@ -438,46 +520,46 @@ const PLAYBOOKS: { match: string[]; book: Playbook }[] = [
   {
     match: ['dexs'],
     book: {
-      core: (p, c, ch) => `Provide $${c} of liquidity to ${p.name}'s deepest USDC pair on ${ch}, favouring a stable or correlated pair for a first position.`,
-      second: (p, c, ch) => `Route two or three small swaps through ${p.name}'s own interface on ${ch} so the wallet shows both trader and liquidity activity.`,
+      core: (p, c, ch) => `Provide $${c} of liquidity to ${p.name}'s deepest USDC pair on ${ch}, favouring a stable or correlated pair first.`,
+      second: (p, c, ch) => `Route two or three small swaps through ${p.name}'s own interface on ${ch}, so the wallet shows trader as well as liquidity activity.`,
       weekly: 'rebalance or top up the pool position once',
-      caution: 'Liquidity positions can lose to impermanent loss when the pair moves apart; a stable pair caps that risk but also caps the fees.',
+      caution: 'Impermanent loss is the risk when the pair moves apart; a stable pair caps it, and caps the fees too.',
     },
   },
   {
     match: ['lending', 'uncollateralized lending'],
     book: {
       core: (p, c, ch) => `Supply $${c} of USDC to ${p.name} on ${ch} and leave the deposit untouched.`,
-      second: (p, c) => `Borrow about 25% of the deposit's value against it, hold the borrow a few days, then repay in full: both sides of the market count.`,
+      second: (p, c) => `Borrow about 25% of the deposit's value against it, hold a few days, then repay in full: both sides of the market count.`,
       weekly: 'add a small top-up deposit or adjust the borrow once',
-      caution: 'Never let the health factor of the position drift toward liquidation; keep the borrow small and check it after any sharp market move.',
+      caution: 'Never let the health factor drift toward liquidation; keep the borrow small and recheck it after sharp market moves.',
     },
   },
   {
     match: ['cdp', 'cdp manager'],
     book: {
       core: (p, c, ch) => `Open a vault on ${p.name} on ${ch} with $${c} of collateral and mint a modest amount of its stablecoin against it.`,
-      second: (p) => `Park the minted stablecoin in ${p.name}'s own stability pool or savings module, if it offers one, so both mint and hold are recorded.`,
+      second: (p) => `Park the minted stablecoin in ${p.name}'s own stability pool or savings module, if it offers one, so mint and hold are both recorded.`,
       weekly: 'check the collateral ratio and top up or repay once',
-      caution: 'Keep the collateral ratio far above the liquidation line; a minted position is a debt, and volatile collateral can close fast.',
+      caution: 'Stay far above the liquidation line; a minted position is a debt, and volatile collateral closes fast.',
     },
   },
   {
     match: ['derivatives', 'options', 'options vault', 'interest rate derivatives', 'synthetics'],
     book: {
       core: (p, c, ch) => `Deposit $${c} of USDC as margin on ${p.name} on ${ch} and open one small position at 1x, hedged against a spot holding of the same size.`,
-      second: (p) => `Close and reopen the hedge once so the wallet records completed trades, not only a deposit, on ${p.name}.`,
+      second: (p) => `Close and reopen the hedge once, so the wallet records completed trades on ${p.name}, not only a deposit.`,
       weekly: 'roll or resize the hedge once',
-      caution: 'Funding rates can turn against a held hedge and leverage multiplies every mistake; this plan never goes past 1x.',
+      caution: 'Funding can turn against a held hedge, and leverage multiplies mistakes; this plan never goes past 1x.',
     },
   },
   {
     match: ['risk curators', 'onchain capital allocator', 'collateral management'],
     book: {
-      core: (p, c, ch) => `Read the strategy page of two or three vaults ${p.name} curates on ${ch}, then deposit $${c} split across the two whose assets you understand best.`,
+      core: (p, c, ch) => `Read the strategy pages of two or three vaults ${p.name} curates on ${ch}, then deposit $${c} split across the two whose assets you understand best.`,
       second: (p, c) => `Move a small test amount, about a fifth of the position, from one ${p.name} vault to another once, so the wallet shows active allocation.`,
       weekly: 'review the vaults\' reported yield and holdings once',
-      caution: 'A curated vault is someone else\'s strategy with your money: curator risk is real, yields are not guaranteed, and withdrawals can queue.',
+      caution: 'A curated vault is someone else\'s strategy with your money: yields are not guaranteed and withdrawals can queue.',
     },
   },
   {
@@ -486,25 +568,25 @@ const PLAYBOOKS: { match: string[]; book: Playbook }[] = [
       core: (p, c, ch) => `Deposit $${c} of USDC into ${p.name}'s flagship vault on ${ch} and keep the vault shares in the wallet.`,
       second: (p) => `Claim any rewards ${p.name} accrues once and restake or hold them in the same wallet, so the claim is on record.`,
       weekly: 'claim or compound the accrued rewards once',
-      caution: 'Vault yield is a strategy return, not interest: it can go negative in a bad week, and leveraged variants can be liquidated.',
+      caution: 'Vault yield is a strategy return, not interest, and can go negative in a bad week; leveraged variants can be liquidated.',
     },
   },
   {
     match: ['rwa'],
     book: {
-      core: (p, c, ch) => `Complete ${p.name}'s onboarding on ${ch} if it asks for it, then mint $${c} of its yield-bearing asset with a first small amount.`,
+      core: (p, c, ch) => `Complete ${p.name}'s onboarding on ${ch} if it asks for it, then mint a first small $${c} of its yield-bearing asset.`,
       second: (p) => `Hold the minted asset through one full payout or reporting cycle on ${p.name} before adding anything more.`,
       weekly: 'check the asset\'s reported value and payout notices once',
-      caution: 'Real-world-asset products can require identity checks and pay out on fixed windows; redemptions are rarely instant, so size it as locked money.',
+      caution: 'RWA products can require identity checks and pay out on fixed windows; redemptions are rarely instant, so size it as locked money.',
     },
   },
   {
     match: ['restaking', 'liquid restaking', 'staking pool', 'liquid staking'],
     book: {
       core: (p, c, ch) => `Stake $${c} of ${ch}'s staking asset through ${p.name} and keep the receipt token in the wallet.`,
-      second: (p) => `Put the receipt token to work in one place ${p.name} itself points to, such as its restaking or rewards module, rather than a third-party farm.`,
+      second: (p) => `Put the receipt token to work where ${p.name} itself points, such as its restaking or rewards module, not a third-party farm.`,
       weekly: 'check the receipt token\'s exchange rate and any points balance once',
-      caution: 'Staked positions can take a week or more to withdraw and carry slashing risk; never stake funds you may need back quickly.',
+      caution: 'Withdrawals can take a week or more and slashing is possible; never stake funds you may need back quickly.',
     },
   },
   {
@@ -513,25 +595,25 @@ const PLAYBOOKS: { match: string[]; book: Playbook }[] = [
       core: (p, c, ch) => `Bridge $${c} of USDC through ${p.name} to ${ch}, then use the bridged funds in one app on the far side.`,
       second: (p, c, ch) => `Bridge a smaller amount back through ${p.name} a week later, so the wallet shows a round trip, not a one-way exit.`,
       weekly: 'make one small bridge transfer',
-      caution: 'Bridges are the most exploited contracts in the industry: use only the protocol\'s own published interface and test with a small amount first.',
+      caution: 'Bridges are the most exploited contracts in the industry: use only the protocol\'s own interface and test small first.',
     },
   },
   {
     match: ['chain'],
     book: {
-      core: (p, c, ch) => `Bridge $${c} of USDC to ${ch} and make it the wallet's home chain for this farm: hold a small balance of its gas token as well.`,
+      core: (p, c, ch) => `Bridge $${c} of USDC to ${ch} and make it the wallet's home chain for this farm, holding a small balance of its gas token too.`,
       second: (p) => `Use two or three of the chain's native apps (its main exchange and lending market) with small amounts, so the wallet looks like a resident, not a passer-by.`,
       weekly: 'make one transaction in a native app',
-      caution: 'Young chains carry young contracts: audits are thinner and bridges are the weak point, so keep the position sized as an experiment.',
+      caution: 'Young chains carry young contracts: audits are thinner, bridges are the weak point, so size it as an experiment.',
     },
   },
   {
     match: ['prediction market'],
     book: {
       core: (p, c) => `Fund the wallet with $${c} on ${p.name} and place small positions in two or three of its most liquid markets.`,
-      second: (p) => `Hold one position to settlement on ${p.name} so the wallet records a completed market, win or lose.`,
+      second: (p) => `Hold one position to settlement on ${p.name}, so the wallet records a completed market, win or lose.`,
       weekly: 'place or adjust one market position',
-      caution: 'Prediction stakes are spent money with a possible payout, not a deposit: assume any single position can go to zero.',
+      caution: 'Prediction stakes are spent money with a possible payout, not a deposit: any single position can go to zero.',
     },
   },
   {
@@ -540,16 +622,16 @@ const PLAYBOOKS: { match: string[]; book: Playbook }[] = [
       core: (p, c, ch) => `Buy $${c} of cover from ${p.name} on ${ch} against a large, well-known protocol and hold the policy to expiry.`,
       second: (p) => `Renew or extend the cover once when it lapses, so the wallet shows a continuing customer of ${p.name}.`,
       weekly: 'check the policy status once',
-      caution: 'Cover pays only on the events its terms name; read the exclusions before counting it as protection.',
+      caution: 'Cover pays only on the events its terms name; read the exclusions first.',
     },
   },
   {
     match: ['launchpad'],
     book: {
-      core: (p, c, ch) => `Register the wallet for one open sale or allowlist on ${p.name} on ${ch} and complete the tasks it lists, staking the $${c} minimum only if the sale asks for it.`,
+      core: (p, c, ch) => `Register the wallet for one open sale or allowlist on ${p.name} on ${ch} and complete its listed tasks, staking the $${c} minimum only if the sale asks for it.`,
       second: (p) => `Take part in one launch on ${p.name} with a small amount, or record the completed registration if no launch is open.`,
       weekly: 'check for newly opened registrations once',
-      caution: 'No legitimate launchpad guarantees an allocation for a fee; anyone promising one for extra payment is running a scam.',
+      caution: 'No legitimate launchpad guarantees an allocation for a fee; anyone promising one is running a scam.',
     },
   },
   {
@@ -558,7 +640,7 @@ const PLAYBOOKS: { match: string[]; book: Playbook }[] = [
       core: (p, c, ch) => `Mint $${c} of ${p.name}'s index token on ${ch} and hold it in the wallet.`,
       second: (p) => `Add a small second mint after the next rebalance of the index, so the wallet holds through a composition change.`,
       weekly: 'check the index composition and reported value once',
-      caution: 'An index token is only as sound as its weakest constituent and its rebalancing rules; read both before sizing up.',
+      caution: 'An index token is only as sound as its weakest constituent and its rebalancing rules; read both first.',
     },
   },
   {
@@ -567,16 +649,16 @@ const PLAYBOOKS: { match: string[]; book: Playbook }[] = [
       core: (p, c) => `Open an account with ${p.name}, complete the identity check it requires, and load $${c} or the smallest amount it accepts.`,
       second: (p) => `Make one ordinary payment or transfer through ${p.name} so the account shows real use, not only a balance.`,
       weekly: 'make one small payment or top-up',
-      caution: 'Payment products need identity verification and are not available in every country; check eligibility before moving money in.',
+      caution: 'Payment products need identity verification and are not available everywhere; check eligibility before moving money in.',
     },
   },
   {
     match: ['stablecoin issuer', 'dual-token stablecoin', 'algo-stables', 'stablecoin wrapper'],
     book: {
       core: (p, c, ch) => `Mint or deposit $${c} of the stable asset through ${p.name} on ${ch} and hold it in the wallet.`,
-      second: (p, c, ch) => `Provide a small amount of liquidity for the stable asset in ${p.name}'s main pool on ${ch}, if it maintains one.`,
+      second: (p, c, ch) => `Provide a small amount of liquidity for the stable asset in ${p.name}'s main pool on ${ch}, if it keeps one.`,
       weekly: 'check the asset\'s price against its peg once',
-      caution: 'A stablecoin can lose its peg; keep this position small and watch the price, not just the balance.',
+      caution: 'A stablecoin can lose its peg; keep the position small and watch the price, not the balance.',
     },
   },
 ];
@@ -589,7 +671,7 @@ function playbookFor(p: SnapshotProtocol): Playbook {
     core: (p2, cap, ch) => `Deposit $${cap} of USDC into ${p2.name}'s main product on ${ch} and keep the position open.`,
     second: (p2, cap, ch) => `Make one more deposit or interaction of a different kind in ${p2.name} on ${ch}, so the wallet shows varied use.`,
     weekly: 'make one qualifying interaction',
-    caution: 'Read the protocol\'s own risk page before sizing up; an unfamiliar product keeps the smallest position on this board.',
+    caution: 'Read the protocol\'s risk page before sizing up; an unfamiliar product keeps the smallest position on this board.',
   };
 }
 
@@ -606,14 +688,14 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const secondChain = p.chains.length > 1 ? p.chains[1]! : null;
   const steps: FarmStep[] = [
     {
-      text: `Use a fresh wallet that holds only the funds you plan to farm, keep its seed phrase offline, and fund it with ${gas} for gas on ${chain}.`,
-      cost: 'under $3 of gas for the first transaction',
+      text: `Use a fresh wallet holding only farm funds, keep its seed phrase offline, and fund it with ${gas} for gas on ${chain}.`,
+      cost: 'under $3 of gas',
       time: '5 minutes',
     },
     {
       text: book.core(p, capital, chain),
       cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`,
-      time: '15 minutes to set up',
+      time: '15 minutes',
     },
     {
       text: book.second(p, capital, chain),
@@ -623,30 +705,30 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   ];
   if (secondChain !== null) {
     steps.push({
-      text: `Repeat the core position on ${secondChain} with about half the amount: ${p.name} counts ${p.chains.length} chains, and a wallet active on two of them is harder to mistake for a one-off.`,
+      text: `Repeat the core position on ${secondChain} at half size: activity on two of ${p.name}'s chains reads as a resident, not a one-off.`,
       cost: `about $${Math.round(capital / 2)} of capital and $4 of gas`,
       time: '15 minutes',
     });
   }
   steps.push(
     {
-      text: `Once a week, ${book.weekly}, on the same weekday so the pattern reads as a habit, not a burst.`,
+      text: `Once a week, ${book.weekly}, always on the same weekday, so the pattern reads as a habit, not a burst.`,
       cost: 'about $2 of gas a week',
       time: '10 minutes a week',
     },
     {
-      text: `Hold the position for at least ${hold} days so the activity is counted in more than one weekly snapshot of the protocol.`,
-      cost: `the $${capital} stays in the position`,
+      text: `Hold the position at least ${hold} days, so it lands in more than one weekly snapshot of the protocol.`,
+      cost: `$${capital} stays in the position`,
       time: `${hold} days`,
     },
     {
       text: `Watch-out: ${book.caution}`,
-      cost: 'nothing to read, and it prices the position',
-      time: '10 minutes before you start',
+      cost: 'no cost',
+      time: '10 minutes',
     },
     {
-      text: `Before you withdraw, open ${p.name}'s own points or rewards page and claim only from the link it publishes; then write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.`,
-      cost: 'no fee to check, and never pay to claim',
+      text: `Before withdrawing, claim only from the link on ${p.name}'s own points or rewards page; log the wallet, dates and every transaction so the position can be repeated or unwound.`,
+      cost: 'no fee; never pay to claim',
       time: '10 minutes',
     },
   );
@@ -671,7 +753,7 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
-/** A board row's form for data.js. */
+/** A board row's form for data.js: the leaner RadarRow shape described on the interface. */
 export function radarRow(row: BoardRow): RadarRow {
   return {
     rank: row.rank,
@@ -681,15 +763,10 @@ export function radarRow(row: BoardRow): RadarRow {
     chains: row.chains,
     tvl_usd: row.tvl_usd,
     change_7d: row.change_7d,
-    mcap_usd: row.mcap_usd,
-    listed_at: row.listed_at,
     age_days: row.age_days,
     watchlist: row.watchlist,
     implied_value_usd: row.implied_value_usd,
     peer_multiple: row.model.peer_multiple,
-    peer_count: row.model.peer_count,
-    category_median: row.model.category_median,
-    growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     reason: row.reason,
     farm_steps: row.farm_steps,
@@ -698,9 +775,9 @@ export function radarRow(row: BoardRow): RadarRow {
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const board = buildBoard(snapshot, model);
+  const peers = boardPeers(snapshot, model);
+  const board = scoreBoard(snapshot, peers, model);
   const live = liveRows(snapshot);
-  const peers = peerMultiples(snapshot, model);
   const onBoard = new Set(board.map((r) => r.category ?? 'Uncategorised'));
   const multiples = [...peers.byCategory.values()]
     .filter((m) => onBoard.has(m.category))
